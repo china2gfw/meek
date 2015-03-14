@@ -47,6 +47,7 @@ import (
 	"time"
 )
 
+import goproxy "golang.org/x/net/proxy"
 import "git.torproject.org/pluggable-transports/goptlib.git"
 
 const (
@@ -322,8 +323,12 @@ func acceptLoop(ln *pt.SocksListener) error {
 // configuration.
 func checkProxyURL(u *url.URL) error {
 	if options.HelperAddr == nil {
-		// Without the helper we only support HTTP proxies.
-		if u.Scheme != "http" {
+		// Without the helper we can use HTTP (runtime) and SOCKS5
+		// (golang.org/x/net/proxy).  If the need arises to support
+		// SOCKS4(a) in the future, obfs4proxy has code for that.
+		switch u.Scheme {
+		case "http", "socks5":
+		default:
 			return fmt.Errorf("don't understand proxy URL scheme %q", u.Scheme)
 		}
 	} else {
@@ -416,8 +421,18 @@ func main() {
 			log.Fatal(fmt.Sprintf("proxy error: %s", err))
 		}
 		log.Printf("using proxy %s", options.ProxyURL.String())
-		httpTransport.Proxy = http.ProxyURL(options.ProxyURL)
 		if ptProxyURL != nil {
+			// Configure the http transport proxy.
+			if options.HelperAddr != nil || ptProxyURL.Scheme == "http" {
+				httpTransport.Proxy = http.ProxyURL(options.ProxyURL)
+			} else {
+				proxyDialer, err := goproxy.FromURL(options.ProxyURL, goproxy.Direct)
+				if err != nil {
+					PtProxyError(err.Error())
+					log.Fatalf("failed to set proxy: %s", err)
+				}
+				httpTransport.Dial = proxyDialer.Dial
+			}
 			PtProxyDone()
 		}
 	}
