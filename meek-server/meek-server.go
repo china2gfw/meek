@@ -28,6 +28,7 @@ import (
 )
 
 import "git.torproject.org/pluggable-transports/goptlib.git"
+import "github.com/tsenart/tb"
 
 const (
 	ptMethodName = "meek"
@@ -47,9 +48,16 @@ const (
 	// Cull unused session ids (with their corresponding OR port connection)
 	// if we haven't seen any activity for this long.
 	maxSessionStaleness = 120 * time.Second
+	// Tick rate for the token bucket rate limiter.
+	tokenBucketTickRate = 10 * time.Millisecond
+	// Max non-POST request per second.
+	maxNonPostsPerSecond = 10
 )
 
 var ptInfo pt.ServerInfo
+
+var otherBucket *tb.Bucket
+var postBucket *tb.Bucket
 
 // When a connection handler starts, +1 is written to this channel; when it
 // ends, -1 is written.
@@ -100,6 +108,50 @@ func (state *State) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer func() {
 		handlerChan <- -1
 	}()
+
+
+	// I has a bucket.
+	if otherBucket != nil && postBucket != nil {
+		// Pick the right bucket, where one covers "POST" requests
+		// (AKA useful traffic, configurable), the other covers
+		// everything else (diagnostic at best).
+		var bucket *tb.Bucket
+		if req.Method != "POST" {
+			bucket = otherBucket
+		} else {
+			bucket = postBucket
+		}
+
+		// So there's two things that can be done here to rate limit
+		// connections.  One is to Wait() on tokens being available,
+		// leading to a rediculous number of goroutines being created
+		// if someone is DDoSing the server.  The other alternative is
+		// to drop requests on the floor.
+		//
+		// This opts to drop requests under load.
+		if taken := bucket.Take(1); taken == 0 {
+			// Oh noes, itz empty.
+			//
+			// Due to massive braindamage in Go's http server,
+			// there is no easy way to drop a request on the floor.
+			// This attempts the less stupid way, and falls back to
+			// something that will work, but spam the log with
+			// stack traces.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				// http's internal c.server() method will recover
+				// from this, but it'll log a stack trace.  Hope
+				// you aren't logging to a file.
+				panic("rate limit reached, can't hijack")
+			}
+			c, _, err := hj.Hijack()
+			if err != nil {
+				panic("rate limit reached, failed to hijack")
+			}
+			c.Close()
+			return
+		}
+	}
 
 	switch req.Method {
 	case "GET":
@@ -320,12 +372,14 @@ func main() {
 	var certFilename, keyFilename string
 	var logFilename string
 	var port int
+	var maxPostsPerSec int
 
 	flag.BoolVar(&disableTLS, "disable-tls", false, "don't use HTTPS")
 	flag.StringVar(&certFilename, "cert", "", "TLS certificate file (required without --disable-tls)")
 	flag.StringVar(&keyFilename, "key", "", "TLS private key file (required without --disable-tls)")
 	flag.StringVar(&logFilename, "log", "", "name of log file")
 	flag.IntVar(&port, "port", 0, "port to listen on")
+	flag.IntVar(&maxPostsPerSec, "max-posts-per-sec", 0, "maximum POST requests per second")
 	flag.Parse()
 
 	if logFilename != "" {
@@ -345,6 +399,14 @@ func main() {
 		if certFilename == "" || keyFilename == "" {
 			log.Fatalf("The --cert and --key options are required.\n")
 		}
+	}
+
+	if maxPostsPerSec > 0 {
+		throttler := tb.NewThrottler(tokenBucketTickRate)
+		defer throttler.Close()
+
+		postBucket = throttler.Bucket("POST", int64(maxPostsPerSec))
+		otherBucket = throttler.Bucket("GET", maxNonPostsPerSecond)
 	}
 
 	var err error
